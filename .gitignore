@@ -1,0 +1,9 @@
+# project meta
+.vscode
+
+# db files
+data/
+data.sqlite
+
+# logs
+*.log

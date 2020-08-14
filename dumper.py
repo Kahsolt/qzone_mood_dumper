@@ -2,7 +2,9 @@
 # 2019/07/19
 
 import os
+import sys
 import time
+import re
 import json
 import sqlite3
 import logging
@@ -21,11 +23,19 @@ URL_DETAIL = URL_API_BASE + '/emotion_cgi_msgdetail_v6'
 HEADERS = { 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1' }
 
 DB_FILE = 'data.sqlite'
-UPDATE_MODE = os.getenv('update').lower() != 'false'
+DATA_DIR = 'data'
 PAGE_SIZE = 20
+UPDATE_MODE = os.getenv('update') not in ['false', '0']
+HEADLESS = os.getenv('headless') not in ['false', '0']
+TITLE_REGEX = re.compile('\[.*?\]《.*?》')
+FILENAME_BAD_CHAR_REGEX = re.compile('\\\\|/|:|\*|\?|"|<|>|\|')
 
 logging.basicConfig(level=logging.INFO, 
                     format='%(asctime)s: [%(levelname)s] %(message)s')
+
+# fixups
+from builtins import open as _open
+open = lambda fp, rw: _open(fp, rw, encoding='utf8')
 
 # Data storage
 class SQLite3:
@@ -105,7 +115,7 @@ class Mood:
     moods = [ ]
     for row in data:
       id, title, content, timestamp = row
-      mood = Mood(id=id, title=title, content=content, timestamp=timestamp)
+      mood = Mood(id=id, title=title, content=content, timestamp=datetime.fromisoformat(timestamp))
       moods.append(mood)
     return moods
 
@@ -116,6 +126,10 @@ class Mood:
     data = self.engine.query(sql)
     if data: self.id = data[0][0]
 
+  @property
+  def datetime(self):
+    return self.timestamp.isoformat().split('T')[0]
+
 # Operations
 setup_db = lambda: Mood.bind(SQLite3())
 teardown_db = lambda: Mood.engine.close()
@@ -123,31 +137,34 @@ teardown_db = lambda: Mood.engine.close()
 def dump(update=UPDATE_MODE):
   # open browser
   profile = webdriver.FirefoxProfile()
-  profile.set_preference('permissions.default.image', 2)
+  if HEADLESS: profile.set_preference('permissions.default.image', 2)
   profile.set_preference('browser.migration.version', 9001)
   options = webdriver.FirefoxOptions()
+  options.add_argument('log-level=3')   # FATAL
   options.add_argument('--disable-extensions')
-  options.add_argument('-headless')
+  if HEADLESS: options.add_argument('-headless')
   
   browser = webdriver.Firefox(options=options, firefox_profile=profile)
   browser.implicitly_wait(5)
   wait = WebDriverWait(browser, 10, poll_frequency=1)
 
   # login
-  qq = os.getenv('qq')
-  while not qq: qq = input('输入QQ号：')
-  passwd = os.getenv('passwd')
-  while not passwd: passwd = input('输入QQ密码：')
-
   browser.get(URL_BASE)
   wait.until(cond.frame_to_be_available_and_switch_to_it('login_frame'))
   wait.until(cond.element_to_be_clickable((By.ID, 'switcher_plogin')))
   browser.find_element_by_id('switcher_plogin').click()
-  browser.find_element_by_id('u').send_keys(qq)
-  browser.find_element_by_id('p').send_keys(passwd)
-  wait.until(cond.element_to_be_clickable((By.ID, 'login_button')))
-  browser.find_element_by_id('login_button').click()
-  time.sleep(5)  # await for cookies
+  
+  qq, passwd = os.getenv('qq'), os.getenv('passwd')
+  if qq and passwd:
+    print('[Login] using QQ code and password from envvar')
+    browser.find_element_by_id('u').send_keys(qq)
+    browser.find_element_by_id('p').send_keys(passwd)
+    wait.until(cond.element_to_be_clickable((By.ID, 'login_button')))
+    browser.find_element_by_id('login_button').click()
+    time.sleep(5)  # await for cookies
+  else:
+    print('[Login] manual interactive login then press Enter to continue')
+    input()
 
   def getCSRFToken(skey):   # transcribed from qzone source javascript snippet
     hs = 5381
@@ -182,6 +199,7 @@ def dump(update=UPDATE_MODE):
   }
   while pid >= 0:
     if totcnt > 0 and pid * PAGE_SIZE > totcnt: break
+    time.sleep(1)
     logging.info('[Dumper] crawling on page %d' % pid)
     params['pos'] = (pid - 1) * PAGE_SIZE
     res = http.get(URL_LIST, params=params, cookies=cookies)
@@ -203,9 +221,7 @@ def dump(update=UPDATE_MODE):
         res = http.get(URL_DETAIL, params=params)
         try: data = json.loads(res.text[16:-2])
         except json.decoder.JSONDecodeError: logging.info(res.text)
-        content = data.get('content')
-      else:
-        content = mood.get('content')
+      content = data.get('content')
       title = '\n' in content and content.split('\n')[0] or content[:16]
       
       mood = Mood(title=title, content=content, timestamp=timestamp)
@@ -216,11 +232,46 @@ def dump(update=UPDATE_MODE):
     pid += 1
   logging.info('[Save] updated %d items in total' % cnt)
 
+def format_md(mood):
+  return '''---
+title: %s
+date: %s
+categories: 蜂草
+---
+
+<br/>
+
+%s
+''' % (mood.title, mood.datetime, mood.content)
+
+def export():
+  os.makedirs(os.path.join(BASE_PATH, DATA_DIR), exist_ok=True)
+
+  for mood in Mood.all():
+    if not TITLE_REGEX.match(mood.title):
+      print('skip %s' % mood.title)
+      continue
+
+    fn = '%s %s.md' % (mood.datetime, mood.title)
+    fn = FILENAME_BAD_CHAR_REGEX.sub('-', fn)
+    fp = os.path.join(BASE_PATH, DATA_DIR, fn)
+    if os.path.exists(fp): continue
+
+    with open(fp, 'w') as fh:
+      md = format_md(mood)
+      fh.write(md)
+
 # main
 if __name__ == '__main__':
+  action = len(sys.argv) == 2 and sys.argv[1]
+  if not action:
+    print('Usage: %s <dump|export>' % sys.argv[0])
+    exit(-1)
+  
   try:
     setup_db()
-    dump()
+    if action == 'dump': dump()
+    elif action == 'export': export()
   except Exception as e:
     logging.error(e)
     import traceback; traceback.print_exc()

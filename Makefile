@@ -1,8 +1,8 @@
 all:
-	python dumper.py
+	python dumper.py dump
 
-markdown:
-	python export.py markdown
+md:
+	python dumper.py export
 
 sql:
 	sqlite3 data.sqlite

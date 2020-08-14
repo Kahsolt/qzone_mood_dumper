@@ -3,7 +3,7 @@
 
 # db files
 data/
-data.sqlite
+data.sqlite*
 
 # logs
 *.log
